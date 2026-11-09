@@ -34,7 +34,7 @@ const unsigned long PAUSA_PULSO = 200;
 const unsigned long PAUSA_CICLO = 1000;
 
 const byte PULSOS_POR_CICLO = 3;
-const byte MAX_CICLOS = 3;
+const byte MAX_CICLOS = 4;
 
 // Tiempo maximo sin detectar latidos
 // Evita actuar sobre una medicion antigua.
