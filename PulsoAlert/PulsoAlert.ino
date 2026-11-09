@@ -1,915 +1,448 @@
-
 /*
- * ============================================================
- * PROYECTO: PULSOALERT
- * VERSION : 1.3
- * PLACA   : ESP32-C3 OLED 0.42"
- * SENSOR  : MAX30102
- * ============================================================
+ * PulsoAlert v1.4.1 - ESP32-C3 OLED 72x40 + MAX30102
  *
- * DESCRIPCION:
+ * GPIO5 SDA / GPIO6 SCL: OLED y MAX30102 (I2C compartido)
+ * GPIO4: driver motor (activo HIGH; NO conectar motor directo)
+ * GPIO8: LED integrado (activo LOW)
+ * GPIO9: boton BOOT (activo LOW; evitar pulsarlo al encender)
+ * GPIO0: lectura ADC de bateria mediante divisor 100k/100k
  *
- * Sistema experimental de monitoreo de frecuencia cardiaca.
- *
- * Funcionalidades:
- *  - Medicion de BPM mediante MAX30102.
- *  - Visualizacion en pantalla OLED.
- *  - Deteccion de frecuencia inferior al umbral.
- *  - Confirmacion temporal antes de generar una alerta.
- *  - Control de motor de vibracion.
- *  - Control independiente del LED integrado.
- *  - Cancelacion al recuperar el pulso o retirar el dedo.
- *
- * IMPORTANTE:
- * Prototipo educativo. No es un dispositivo medico.
- *
- * ============================================================
+ * Prototipo educativo, no dispositivo medico.
+ * No interpretar perdida de senal como frecuencia cardiaca baja.
+ * La bateria LiPo requiere alimentacion regulada/protegida apropiada.
  */
-
-
-// ============================================================
-// 1. BIBLIOTECAS
-// ============================================================
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <MAX30105.h>
-#include <heartRate.h>
-
-
-// ============================================================
-// 2. CONFIGURACION DE PINES
-// ============================================================
-
-// Bus I2C compartido por OLED y MAX30102.
-// Pines verificados en el montaje actual.
-#define SDA_PIN 5
-#define SCL_PIN 6
-
-// Salida de control del motor mediante transistor.
-// Controlador activo en HIGH.
-#define MOTOR_PIN 4
-
-// LED integrado de la placa ESP32-C3.
-// El LED funciona con logica invertida.
-#define LED_PIN 8
-
-#define LED_ENCENDIDO LOW
-#define LED_APAGADO HIGH
-
+#include "heartRate.h"
 
 // ============================================================
-// 3. PARAMETROS CONFIGURABLES
+// 1. HARDWARE Y CONFIGURACION
 // ============================================================
-//
-// Estos parametros podran modificarse posteriormente
-// desde una aplicacion Android mediante Bluetooth LE.
-//
-// Los tiempos se expresan en milisegundos.
-// ============================================================
+constexpr uint8_t PIN_SDA = 5;
+constexpr uint8_t PIN_SCL = 6;
+constexpr uint8_t PIN_MOTOR = 4;
+constexpr uint8_t PIN_LED = 8;
+constexpr uint8_t PIN_BOOT = 9;
+constexpr uint8_t PIN_BATERIA = 0;
+constexpr uint8_t MOTOR_ON = HIGH;
+constexpr uint8_t MOTOR_OFF = LOW;
+constexpr uint8_t LED_ON = LOW;
+constexpr uint8_t LED_OFF = HIGH;
 
-// Frecuencia minima aceptada antes de generar una alerta.
-int UMBRAL_BPM = 50;
-
-// Tiempo que debe mantenerse el BPM bajo para activar alerta.
-unsigned long TIEMPO_ALERTA = 5000;
-
-// Numero maximo de ciclos de vibracion del motor.
-byte MAX_CICLOS_MOTOR = 3;
-
-// Tiempo maximo de funcionamiento del LED.
-// 120000 ms equivalen a 2 minutos.
-unsigned long TIEMPO_MAX_LED = 15000;
-
-// Duracion de cada pulso activo.
-unsigned long DURACION_PULSO = 300;
-
-// Pausa entre pulsos del mismo ciclo.
-unsigned long PAUSA_PULSO = 200;
-
-// Pausa entre ciclos completos.
-unsigned long PAUSA_CICLO = 1000;
-
-// Cantidad de pulsos que componen cada ciclo.
-const byte PULSOS_POR_CICLO = 3;
-
-
-// ============================================================
-// 4. PARAMETROS DE MEDICION
-// ============================================================
-
-// Intensidad infrarroja minima para considerar dedo presente.
-const long UMBRAL_DEDO = 50000;
-
-// Cantidad de lecturas utilizadas para calcular promedio BPM.
-const byte CANTIDAD_MUESTRAS = 4;
-
-// Rango aceptado para las mediciones individuales.
-const float BPM_MIN_VALIDO = 30.0f;
-const float BPM_MAX_VALIDO = 220.0f;
-
-// Tiempo maximo sin detectar un latido.
-// Despues de este tiempo, el BPM deja de considerarse vigente.
-//
-// NOTA:
-// Este valor es provisional y requiere validacion para
-// frecuencias cardiacas muy bajas.
-const unsigned long TIEMPO_SIN_LATIDO = 4000;
-
-
-// ============================================================
-// 5. INTERVALOS DE ACTUALIZACION
-// ============================================================
-
-// Tiempo entre actualizaciones de pantalla.
-const unsigned long INTERVALO_PANTALLA = 200;
-
-
-// ============================================================
-// 6. COMPONENTES
-// ============================================================
-
-// Pantalla OLED integrada de 72 x 40 pixeles.
-U8G2_SSD1306_72X40_ER_F_HW_I2C oled(
-    U8G2_R0,
-    U8X8_PIN_NONE,
-    SCL_PIN,
-    SDA_PIN
-);
-
-// Sensor MAX30102.
-// La biblioteca utiliza la clase MAX30105.
 MAX30105 sensor;
-
+U8G2_SSD1306_72X40_ER_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 // ============================================================
-// 7. VARIABLES DE FRECUENCIA CARDIACA
+// 2. MEDICION DE FRECUENCIA CARDIACA
 // ============================================================
-
-// Historial circular de mediciones BPM.
-byte historialBPM[CANTIDAD_MUESTRAS] = {0};
-
-// Posicion donde se guardara la siguiente medicion.
-byte indice = 0;
-
-// Numero de muestras validas disponibles.
-byte muestrasValidas = 0;
-
-// Instante del ultimo latido detectado.
+constexpr uint32_t IR_MINIMO = 50000;
+constexpr unsigned long SIN_LATIDO_MS = 4000;
+constexpr uint8_t NUM_MUESTRAS_BPM = 4;
+uint8_t muestrasBPM[NUM_MUESTRAS_BPM] = {};
+uint8_t indiceBPM = 0;
+uint8_t muestrasValidas = 0;
+float bpmInstantaneo = 0.0f;
+float bpmPromedio = 0.0f;
 unsigned long ultimoLatido = 0;
-
-// Instante de la ultima actualizacion de pantalla.
-unsigned long ultimaPantalla = 0;
-
-// Frecuencia calculada a partir del ultimo intervalo.
-float bpm = 0;
-
-// Promedio de las ultimas mediciones validas.
-int bpmPromedio = 0;
-
-// Indica si el sensor detecta un dedo.
-bool dedoDetectado = false;
-
+bool dedoPresente = false;
+bool bpmValido = false;
 
 // ============================================================
-// 8. ESTADOS DEL SISTEMA DE ALERTA
+// 3. ALERTAS: UMBRAL, RECUPERACION Y ACTUADORES
 // ============================================================
-//
-// NORMAL:
-// No existe condicion de alerta.
-//
-// ESPERANDO_ALERTA:
-// El BPM esta bajo el umbral y se esta contando el tiempo.
-//
-// ALERTA_ACTIVA:
-// Motor y LED ejecutan sus respectivos patrones.
-//
-// ALERTA_FINALIZADA:
-// Se completaron los tiempos maximos.
-// No se repite hasta que desaparezca la condicion de alerta.
-// ============================================================
+constexpr float UMBRAL_BPM = 50.0f;
+constexpr unsigned long CONFIRMAR_BAJA_MS = 5000;
+constexpr unsigned long CONFIRMAR_RECUPERACION_MS = 2000;
+constexpr unsigned long LED_MAX_MS = 120000;
+constexpr unsigned long MOTOR_PULSO_MS = 300;
+constexpr unsigned long MOTOR_ENTREPULSOS_MS = 200;
+constexpr unsigned long MOTOR_ENTRECICLOS_MS = 1000;
+constexpr uint8_t PULSOS_POR_CICLO = 3;
+constexpr uint8_t MAX_CICLOS = 3;
 
-enum EstadoAlerta {
-    NORMAL,
-    ESPERANDO_ALERTA,
-    ALERTA_ACTIVA,
-    ALERTA_FINALIZADA
-};
-
-// Estado actual de la alerta.
-EstadoAlerta estadoAlerta = NORMAL;
-
-// Instante en que comenzo la condicion de BPM bajo.
-unsigned long inicioBPMBajo = 0;
-
-// Instante en que se activo la alerta.
-unsigned long inicioAlerta = 0;
-
-// Estado fisico de las salidas.
-bool motorEncendido = false;
-bool ledEncendido = false;
-
-// Permiten registrar una sola vez la finalizacion.
-bool motorFinalizado = false;
-bool ledFinalizado = false;
-
+enum class EstadoAlerta : uint8_t { NORMAL, CONFIRMANDO_BAJA, ACTIVA, CONFIRMANDO_RECUPERACION };
+enum class EstadoMotor : uint8_t { INACTIVO, PULSO, PAUSA_PULSO, PAUSA_CICLO, TERMINADO };
+EstadoAlerta estadoAlerta = EstadoAlerta::NORMAL;
+EstadoMotor estadoMotor = EstadoMotor::INACTIVO;
+unsigned long inicioBaja = 0;
+unsigned long inicioRecuperacion = 0;
+unsigned long inicioLED = 0;
+unsigned long inicioFaseMotor = 0;
+uint8_t pulsosTerminados = 0;
+uint8_t ciclosTerminados = 0;
+bool ledActivo = false;
 
 // ============================================================
-// 9. CONTROL DE SALIDAS
+// 4. BATERIA: DIVISOR RESISTIVO Y UMBRALES
 // ============================================================
+constexpr float R1_BATERIA = 100000.0f;
+constexpr float R2_BATERIA = 100000.0f;
+constexpr float FACTOR_DIVISOR = (R1_BATERIA + R2_BATERIA) / R2_BATERIA;
+constexpr float CALIBRACION_BATERIA = 1.0f; // Ajustar comparando con multimetro
+constexpr float BATERIA_BAJA_V = 3.50f;
+constexpr float BATERIA_CRITICA_V = 3.30f;
+constexpr unsigned long LECTURA_BATERIA_MS = 2000;
+constexpr unsigned long CONFIRMAR_BATERIA_MS = 10000;
+constexpr uint8_t MUESTRAS_ADC = 16;
 
-/*
- * Activa o desactiva el motor de vibracion.
- *
- * El GPIO controla un transistor o circuito de potencia.
- * El motor no se conecta directamente al ESP32-C3.
- */
-void controlarMotor(bool encender) {
+enum class EstadoBateria : uint8_t { NORMAL, BAJA, CRITICA };
+// Prototipo explicito: evita fallo de autogeneracion de Arduino con enums.
+EstadoBateria clasificarBateria(float voltaje);
+EstadoBateria estadoBateria = EstadoBateria::NORMAL;
+EstadoBateria estadoBateriaPendiente = EstadoBateria::NORMAL;
+float voltajeBateria = 0.0f;
+unsigned long ultimaBateria = 0;
+unsigned long inicioEstadoBateria = 0;
+bool bateriaInicializada = false;
 
-    // Evitar escrituras innecesarias.
-    if (motorEncendido == encender) {
-        return;
+// ============================================================
+// 5. PANTALLAS Y BOTON BOOT
+// ============================================================
+enum class PantallaOLED : uint8_t { PRINCIPAL, CONFIGURACION };
+PantallaOLED pantallaActual = PantallaOLED::PRINCIPAL;
+constexpr unsigned long REBOTE_BOOT_MS = 50;
+constexpr unsigned long OLED_INTERVALO_MS = 200;
+unsigned long ultimoCambioBoot = 0;
+unsigned long ultimaOLED = 0;
+bool bootLecturaAnterior = HIGH;
+bool bootEstadoEstable = HIGH;
+
+// ============================================================
+// 6. FUNCIONES DEL MOTOR Y LED
+// ============================================================
+void apagarMotor() { digitalWrite(PIN_MOTOR, MOTOR_OFF); }
+void apagarLED() { digitalWrite(PIN_LED, LED_OFF); ledActivo = false; }
+void detenerMotor() {
+  apagarMotor();
+  estadoMotor = EstadoMotor::INACTIVO;
+  pulsosTerminados = 0;
+  ciclosTerminados = 0;
+}
+void iniciarMotor(unsigned long ahora) {
+  pulsosTerminados = 0;
+  ciclosTerminados = 0;
+  inicioFaseMotor = ahora;
+  estadoMotor = EstadoMotor::PULSO;
+  digitalWrite(PIN_MOTOR, MOTOR_ON);
+}
+void iniciarLED(unsigned long ahora) {
+  digitalWrite(PIN_LED, LED_ON);
+  ledActivo = true;
+  inicioLED = ahora;
+}
+void actualizarLED(unsigned long ahora) {
+  if (ledActivo && ahora - inicioLED >= LED_MAX_MS) apagarLED();
+}
+void actualizarMotor(unsigned long ahora) {
+  switch (estadoMotor) {
+    case EstadoMotor::PULSO:
+      if (ahora - inicioFaseMotor >= MOTOR_PULSO_MS) {
+        apagarMotor();
+        ++pulsosTerminados;
+        inicioFaseMotor = ahora;
+        estadoMotor = EstadoMotor::PAUSA_PULSO;
+      }
+      break;
+    case EstadoMotor::PAUSA_PULSO:
+      if (ahora - inicioFaseMotor >= MOTOR_ENTREPULSOS_MS) {
+        inicioFaseMotor = ahora;
+        if (pulsosTerminados < PULSOS_POR_CICLO) {
+          digitalWrite(PIN_MOTOR, MOTOR_ON);
+          estadoMotor = EstadoMotor::PULSO;
+        } else {
+          ++ciclosTerminados;
+          estadoMotor = (ciclosTerminados >= MAX_CICLOS)
+            ? EstadoMotor::TERMINADO : EstadoMotor::PAUSA_CICLO;
+        }
+      }
+      break;
+    case EstadoMotor::PAUSA_CICLO:
+      if (ahora - inicioFaseMotor >= MOTOR_ENTRECICLOS_MS) {
+        pulsosTerminados = 0;
+        inicioFaseMotor = ahora;
+        estadoMotor = EstadoMotor::PULSO;
+        digitalWrite(PIN_MOTOR, MOTOR_ON);
+      }
+      break;
+    default: break;
+  }
+}
+
+// ============================================================
+// 7. SENSOR MAX30102
+// ============================================================
+void reiniciarMediciones() {
+  bpmInstantaneo = 0;
+  bpmPromedio = 0;
+  bpmValido = false;
+  indiceBPM = 0;
+  muestrasValidas = 0;
+  ultimoLatido = 0;
+  for (uint8_t i = 0; i < NUM_MUESTRAS_BPM; ++i) muestrasBPM[i] = 0;
+}
+void actualizarSensor(unsigned long ahora) {
+  const uint32_t ir = sensor.getIR();
+  if (ir < IR_MINIMO) {
+    if (dedoPresente) { dedoPresente = false; reiniciarMediciones(); }
+    return;
+  }
+  if (!dedoPresente) { dedoPresente = true; reiniciarMediciones(); }
+  if (checkForBeat(ir)) {
+    if (ultimoLatido != 0) {
+      const unsigned long intervalo = ahora - ultimoLatido;
+      if (intervalo > 0) {
+        const float bpm = 60000.0f / intervalo;
+        if (bpm >= 20.0f && bpm <= 220.0f) {
+          bpmInstantaneo = bpm;
+          muestrasBPM[indiceBPM] = (uint8_t)(bpm + 0.5f);
+          indiceBPM = (indiceBPM + 1) % NUM_MUESTRAS_BPM;
+          if (muestrasValidas < NUM_MUESTRAS_BPM) ++muestrasValidas;
+          uint16_t suma = 0;
+          for (uint8_t i = 0; i < muestrasValidas; ++i) suma += muestrasBPM[i];
+          bpmPromedio = suma / (float)muestrasValidas;
+          bpmValido = true;
+        }
+      }
     }
-
-    motorEncendido = encender;
-
-    digitalWrite(
-        MOTOR_PIN,
-        encender ? HIGH : LOW
-    );
+    ultimoLatido = ahora;
+  }
+  if (ultimoLatido != 0 && ahora - ultimoLatido > SIN_LATIDO_MS) {
+    reiniciarMediciones();
+  }
 }
 
-
-/*
- * Controla el LED integrado de la placa.
- *
- * El LED utiliza logica invertida:
- * LOW  = encendido
- * HIGH = apagado
- */
-void controlarLED(bool encender) {
-
-    if (ledEncendido == encender) {
-        return;
-    }
-
-    ledEncendido = encender;
-
-    digitalWrite(
-        LED_PIN,
-        encender ? LED_ENCENDIDO : LED_APAGADO
-    );
+// ============================================================
+// 8. MAQUINA DE ESTADOS DE ALERTA
+// ============================================================
+void cancelarAlerta() {
+  detenerMotor();
+  apagarLED();
+  estadoAlerta = EstadoAlerta::NORMAL;
+  inicioBaja = 0;
+  inicioRecuperacion = 0;
 }
-
-
-// ============================================================
-// 10. REINICIO DEL SISTEMA DE ALERTA
-// ============================================================
-
-/*
- * Cancela cualquier alerta y restablece sus variables.
- *
- * Se utiliza cuando:
- *  - Se retira el dedo.
- *  - La frecuencia se recupera.
- *  - La medicion deja de ser valida.
- */
-void reiniciarAlerta() {
-
-    controlarMotor(false);
-    controlarLED(false);
-
-    inicioBPMBajo = 0;
-    inicioAlerta = 0;
-
-    motorFinalizado = false;
-    ledFinalizado = false;
-
-    estadoAlerta = NORMAL;
+void activarAlerta(unsigned long ahora) {
+  estadoAlerta = EstadoAlerta::ACTIVA;
+  iniciarMotor(ahora);
+  iniciarLED(ahora);
+  pantallaActual = PantallaOLED::PRINCIPAL; // Prioridad visual de alerta
 }
-
-
-// ============================================================
-// 11. INICIO DE UNA ALERTA
-// ============================================================
-
-/*
- * Registra el instante de inicio de la alerta.
- *
- * A partir de este momento:
- *  - El motor dispone de MAX_CICLOS_MOTOR ciclos.
- *  - El LED dispone de TIEMPO_MAX_LED milisegundos.
- */
-void iniciarAlerta(unsigned long ahora) {
-
-    inicioAlerta = ahora;
-
-    motorFinalizado = false;
-    ledFinalizado = false;
-
-    estadoAlerta = ALERTA_ACTIVA;
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("ALERTA DE FRECUENCIA BAJA");
-    Serial.print("BPM: ");
-    Serial.println(bpmPromedio);
-    Serial.println("Motor y LED iniciados");
-    Serial.println("================================");
-}
-
-
-// ============================================================
-// 12. GENERADOR DEL PATRON DE PULSOS
-// ============================================================
-
-/*
- * Calcula si una salida debe estar encendida en un instante.
- *
- * Patron:
- *
- *  ON  300 ms
- *  OFF 200 ms
- *  ON  300 ms
- *  OFF 200 ms
- *  ON  300 ms
- *  OFF 1000 ms
- *
- * El patron se repite en ciclos.
- *
- * No utiliza delay(), permitiendo continuar con las
- * mediciones mientras se ejecuta la alerta.
- *
- * Parametros:
- *  transcurrido: tiempo desde el inicio de la alerta.
- *  numeroCiclo : recibe el indice del ciclo actual,
- *                comenzando en cero.
- *
- * Retorno:
- *  true  = salida encendida.
- *  false = salida apagada.
- */
-bool obtenerEstadoPulso(
-    unsigned long transcurrido,
-    unsigned long &numeroCiclo
-) {
-
-    // Tiempo total de los pulsos y pausas internas.
-    unsigned long tiempoPulsos =
-        PULSOS_POR_CICLO * DURACION_PULSO +
-        (PULSOS_POR_CICLO - 1) * PAUSA_PULSO;
-
-    // Duracion completa de un ciclo.
-    unsigned long duracionCiclo =
-        tiempoPulsos + PAUSA_CICLO;
-
-    // Proteccion frente a configuraciones invalidas.
-    if (duracionCiclo == 0 ||
-        DURACION_PULSO == 0 ||
-        PULSOS_POR_CICLO == 0) {
-
-        numeroCiclo = 0;
-        return false;
-    }
-
-    // Determinar el ciclo actual.
-    numeroCiclo = transcurrido / duracionCiclo;
-
-    // Posicion temporal dentro del ciclo.
-    unsigned long posicion =
-        transcurrido % duracionCiclo;
-
-    // Estamos en la pausa entre ciclos.
-    if (posicion >= tiempoPulsos) {
-        return false;
-    }
-
-    // Periodo de un pulso y su pausa.
-    unsigned long periodoPulso =
-        DURACION_PULSO + PAUSA_PULSO;
-
-    // Encender solo durante la parte activa del pulso.
-    return (posicion % periodoPulso) < DURACION_PULSO;
-}
-
-
-// ============================================================
-// 13. DURACION MAXIMA DEL MOTOR
-// ============================================================
-
-/*
- * Calcula el instante en que termina el ultimo pulso
- * del ultimo ciclo permitido para el motor.
- *
- * No incluye la pausa posterior al ultimo ciclo,
- * porque el motor ya se encuentra apagado.
- */
-unsigned long obtenerTiempoFinalMotor() {
-
-    if (MAX_CICLOS_MOTOR == 0) {
-        return 0;
-    }
-
-    unsigned long tiempoPulsos =
-        PULSOS_POR_CICLO * DURACION_PULSO +
-        (PULSOS_POR_CICLO - 1) * PAUSA_PULSO;
-
-    unsigned long duracionCiclo =
-        tiempoPulsos + PAUSA_CICLO;
-
-    return
-        (MAX_CICLOS_MOTOR - 1) * duracionCiclo +
-        tiempoPulsos;
-}
-
-
-// ============================================================
-// 14. ACTUALIZACION INDEPENDIENTE MOTOR / LED
-// ============================================================
-
-/*
- * Actualiza las salidas durante una alerta activa.
- *
- * MOTOR:
- * Se apaga definitivamente al completar sus ciclos.
- *
- * LED:
- * Continua ejecutando el patron hasta TIEMPO_MAX_LED.
- *
- * Ambos se detienen anticipadamente cuando
- * evaluarAlerta() detecta una condicion de cancelacion.
- */
 void actualizarAlerta(unsigned long ahora) {
-
-    if (estadoAlerta != ALERTA_ACTIVA) {
-        return;
-    }
-
-    unsigned long transcurrido =
-        ahora - inicioAlerta;
-
-    unsigned long numeroCiclo = 0;
-
-    // Estado del patron en el instante actual.
-    bool pulsoActivo =
-        obtenerEstadoPulso(
-            transcurrido,
-            numeroCiclo
-        );
-
-    // --------------------------------------------------------
-    // CONTROL DEL MOTOR
-    // --------------------------------------------------------
-
-    unsigned long tiempoFinalMotor =
-        obtenerTiempoFinalMotor();
-
-    bool motorPermitido =
-        transcurrido < tiempoFinalMotor &&
-        numeroCiclo < MAX_CICLOS_MOTOR;
-
-    controlarMotor(
-        motorPermitido && pulsoActivo
-    );
-
-    if (!motorPermitido && !motorFinalizado) {
-
-        motorFinalizado = true;
-
-        Serial.println(
-            "Motor: ciclos completados"
-        );
-    }
-
-    // --------------------------------------------------------
-    // CONTROL DEL LED
-    // --------------------------------------------------------
-
-    bool ledPermitido =
-        transcurrido < TIEMPO_MAX_LED;
-
-    controlarLED(
-        ledPermitido && pulsoActivo
-    );
-
-    if (!ledPermitido && !ledFinalizado) {
-
-        ledFinalizado = true;
-
-        Serial.println(
-            "LED: tiempo maximo completado"
-        );
-    }
-
-    // --------------------------------------------------------
-    // FINALIZACION GENERAL
-    // --------------------------------------------------------
-
-    if (!motorPermitido && !ledPermitido) {
-
-        controlarMotor(false);
-        controlarLED(false);
-
-        estadoAlerta = ALERTA_FINALIZADA;
-
-        Serial.println(
-            "Alerta finalizada. Esperando recuperacion."
-        );
-    }
+  if (!dedoPresente || !bpmValido) { cancelarAlerta(); return; }
+  const bool bpmBajas = bpmPromedio < UMBRAL_BPM;
+  switch (estadoAlerta) {
+    case EstadoAlerta::NORMAL:
+      if (bpmBajas) { inicioBaja = ahora; estadoAlerta = EstadoAlerta::CONFIRMANDO_BAJA; }
+      break;
+    case EstadoAlerta::CONFIRMANDO_BAJA:
+      if (!bpmBajas) estadoAlerta = EstadoAlerta::NORMAL;
+      else if (ahora - inicioBaja >= CONFIRMAR_BAJA_MS) activarAlerta(ahora);
+      break;
+    case EstadoAlerta::ACTIVA:
+      if (!bpmBajas) {
+        inicioRecuperacion = ahora;
+        estadoAlerta = EstadoAlerta::CONFIRMANDO_RECUPERACION;
+      }
+      break;
+    case EstadoAlerta::CONFIRMANDO_RECUPERACION:
+      if (bpmBajas) estadoAlerta = EstadoAlerta::ACTIVA;
+      else if (ahora - inicioRecuperacion >= CONFIRMAR_RECUPERACION_MS) cancelarAlerta();
+      break;
+  }
 }
 
-
 // ============================================================
-// 15. EVALUACION DE FRECUENCIA CARDIACA
+// 9. LECTURA Y CLASIFICACION DE BATERIA
 // ============================================================
-
-/*
- * Evalua las condiciones necesarias para generar una alerta.
- *
- * Reglas:
- *
- * 1. Sin dedo o sin BPM valido: cancelar.
- * 2. Sin latidos recientes: cancelar.
- * 3. BPM recuperado: cancelar y habilitar nuevas alertas.
- * 4. BPM bajo: iniciar temporizador de confirmacion.
- * 5. Transcurrido TIEMPO_ALERTA: activar alerta.
- * 6. Al finalizar: no repetir hasta recuperacion.
- */
-void evaluarAlerta(unsigned long ahora) {
-
-    // --------------------------------------------------------
-    // VALIDACION DE MEDICION
-    // --------------------------------------------------------
-
-    bool medicionValida =
-        dedoDetectado &&
-        muestrasValidas > 0 &&
-        ultimoLatido != 0 &&
-        ahora - ultimoLatido <= TIEMPO_SIN_LATIDO;
-
-    if (!medicionValida) {
-
-        if (estadoAlerta != NORMAL) {
-            Serial.println(
-                "Alerta cancelada: medicion no valida"
-            );
-        }
-
-        reiniciarAlerta();
-        return;
-    }
-
-    // --------------------------------------------------------
-    // RECUPERACION DE FRECUENCIA
-    // --------------------------------------------------------
-
-    if (bpmPromedio >= UMBRAL_BPM) {
-
-        if (estadoAlerta != NORMAL) {
-            Serial.println(
-                "Frecuencia recuperada"
-            );
-        }
-
-        reiniciarAlerta();
-        return;
-    }
-
-    // --------------------------------------------------------
-    // DETECCION INICIAL DE BPM BAJO
-    // --------------------------------------------------------
-
-    if (estadoAlerta == NORMAL) {
-
-        estadoAlerta = ESPERANDO_ALERTA;
-        inicioBPMBajo = ahora;
-
-        Serial.print("BPM bajo detectado: ");
-        Serial.println(bpmPromedio);
-    }
-
-    // --------------------------------------------------------
-    // CONFIRMACION TEMPORAL
-    // --------------------------------------------------------
-
-    if (estadoAlerta == ESPERANDO_ALERTA) {
-
-        if (ahora - inicioBPMBajo >= TIEMPO_ALERTA) {
-
-            iniciarAlerta(ahora);
-        }
-    }
-
-    // --------------------------------------------------------
-    // EJECUCION DEL PATRON
-    // --------------------------------------------------------
-
-    actualizarAlerta(ahora);
+float leerVoltajeBateria() {
+  uint32_t suma = 0;
+  for (uint8_t i = 0; i < MUESTRAS_ADC; ++i) suma += analogReadMilliVolts(PIN_BATERIA);
+  const float voltajeADC = (suma / (float)MUESTRAS_ADC) / 1000.0f;
+  return voltajeADC * FACTOR_DIVISOR * CALIBRACION_BATERIA;
+}
+EstadoBateria clasificarBateria(float voltaje) {
+  if (voltaje < BATERIA_CRITICA_V) return EstadoBateria::CRITICA;
+  if (voltaje < BATERIA_BAJA_V) return EstadoBateria::BAJA;
+  return EstadoBateria::NORMAL;
+}
+void actualizarBateria(unsigned long ahora) {
+  if (bateriaInicializada && ahora - ultimaBateria < LECTURA_BATERIA_MS) return;
+  ultimaBateria = ahora;
+  voltajeBateria = leerVoltajeBateria();
+  const EstadoBateria nuevo = clasificarBateria(voltajeBateria);
+  if (!bateriaInicializada) {
+    bateriaInicializada = true;
+    estadoBateria = nuevo;
+    estadoBateriaPendiente = nuevo;
+    inicioEstadoBateria = ahora;
+    return;
+  }
+  if (nuevo != estadoBateriaPendiente) {
+    estadoBateriaPendiente = nuevo;
+    inicioEstadoBateria = ahora;
+  }
+  if (nuevo != estadoBateria && ahora - inicioEstadoBateria >= CONFIRMAR_BATERIA_MS)
+    estadoBateria = nuevo;
 }
 
-
 // ============================================================
-// 16. REINICIO DE MEDICIONES BPM
+// 10. BOTON BOOT: ALTERNAR PANTALLAS SIN BLOQUEOS
 // ============================================================
-
-/*
- * Limpia las mediciones cuando se retira el dedo.
- *
- * No modifica la configuracion del sensor.
- */
-void reiniciarMedicion() {
-
-    bpm = 0;
-    bpmPromedio = 0;
-
-    muestrasValidas = 0;
-    indice = 0;
-
-    ultimoLatido = 0;
+void actualizarBotonBoot(unsigned long ahora) {
+  const bool lectura = digitalRead(PIN_BOOT);
+  if (lectura != bootLecturaAnterior) ultimoCambioBoot = ahora;
+  if (ahora - ultimoCambioBoot >= REBOTE_BOOT_MS && lectura != bootEstadoEstable) {
+    bootEstadoEstable = lectura;
+    if (bootEstadoEstable == LOW) {
+      pantallaActual = (pantallaActual == PantallaOLED::PRINCIPAL)
+        ? PantallaOLED::CONFIGURACION : PantallaOLED::PRINCIPAL;
+      ultimaOLED = ahora - OLED_INTERVALO_MS;
+    }
+  }
+  bootLecturaAnterior = lectura;
 }
 
-
 // ============================================================
-// 17. ACTUALIZACION DE PANTALLA OLED
+// 11. OLED 72x40: ESTADO + BPM GRANDES + BATERIA
 // ============================================================
+void mostrarPantallaPrincipal() {
+  // Primera linea: prioridad a alerta cardiaca.
+  const bool alerta = (estadoAlerta == EstadoAlerta::ACTIVA ||
+                       estadoAlerta == EstadoAlerta::CONFIRMANDO_RECUPERACION);
+  oled.setFont(u8g2_font_5x7_tr);
+  if (alerta) oled.drawStr(0, 7, "ALERTA FC!");
+  else if (!dedoPresente) oled.drawStr(0, 7, "SIN CONTACTO");
+  else if (!bpmValido) oled.drawStr(0, 7, "LEYENDO...");
+  else if (estadoAlerta == EstadoAlerta::CONFIRMANDO_BAJA)
+    oled.drawStr(0, 7, "FC BAJA?");
+  else oled.drawStr(0, 7, "MONITOREO");
 
-/*
- * Presenta:
- *
- *  PULSO  : funcionamiento normal.
- *  BAJO   : esperando confirmacion.
- *  ALERTA : alerta activa o finalizada.
- *
- * Muestra SIN DEDO, LEYENDO o el promedio BPM.
- */
-void actualizarPantalla(unsigned long ahora) {
+ 
+  // ========================================================
+  // BPM: NUMEROS GRANDES EN NEGRITA Y ETIQUETA DINAMICA
+  // ========================================================
+  
+  // Centro: numeros BPM grandes; etiqueta compacta a la derecha.
 
-    oled.clearBuffer();
+  if (bpmValido) {
 
-    oled.setFont(u8g2_font_6x10_tf);
+    char texto[8];
+    snprintf(texto, sizeof(texto), "%.0f", bpmPromedio);
 
-    // Encabezado segun estado del sistema.
-    switch (estadoAlerta) {
+    // Fuente de numeros grandes con trazo grueso.
+    oled.setFont(u8g2_font_helvB14_tr);
+    oled.setFontMode(1);
 
-        case ESPERANDO_ALERTA:
-            oled.drawStr(0, 9, "BAJO");
-            break;
+    // Dibujar BPM.
+    oled.drawStr(0, 29, texto);
 
-        case ALERTA_ACTIVA:
-        case ALERTA_FINALIZADA:
-            oled.drawStr(0, 9, "ALERTA");
-            break;
+    // Calcular el ancho real de los numeros.
+    uint8_t anchoNumeros = oled.getStrWidth(texto);
 
-        default:
-            oled.drawStr(0, 9, "PULSO");
-            break;
+    // Colocar la etiqueta inmediatamente despues.
+    uint8_t posicionBPM = anchoNumeros + 3;
+
+    oled.setFont(u8g2_font_5x7_tf);
+
+    // Evitar que la etiqueta salga de la pantalla.
+    if (posicionBPM + oled.getStrWidth("BPM") <= 72) {
+      oled.drawStr(posicionBPM, 27, "BPM");
     }
+  }
+  else {
+    oled.setFont(u8g2_font_5x7_tf);
+    oled.drawStr(0, 26, "-- BPM");
+  }
 
-    // --------------------------------------------------------
-    // CONTENIDO PRINCIPAL
-    // --------------------------------------------------------
 
-    if (!dedoDetectado) {
-
-        oled.drawStr(0, 27, "SIN DEDO");
-    }
-    else if (
-        muestrasValidas == 0 ||
-        ultimoLatido == 0 ||
-        ahora - ultimoLatido > TIEMPO_SIN_LATIDO
-    ) {
-
-        oled.drawStr(0, 27, "LEYENDO");
-    }
-    else {
-
-        char texto[8];
-
-        snprintf(
-            texto,
-            sizeof(texto),
-            "%d",
-            bpmPromedio
-        );
-
-        oled.setFont(u8g2_font_helvB14_tr);
-        oled.drawStr(0, 30, texto);
-
-        oled.setFont(u8g2_font_5x7_tf);
-        oled.drawStr(43, 30, "BPM");
-    }
-
-    oled.sendBuffer();
+  // Ultima linea: estado abreviado de bateria.
+  oled.setFont(u8g2_font_5x7_tr);
+  if (estadoBateria == EstadoBateria::CRITICA) oled.drawStr(0, 39, "BAT: CARGAR");
+  else if (estadoBateria == EstadoBateria::BAJA) oled.drawStr(0, 39, "BAT: BAJA");
+  else oled.drawStr(0, 39, "BAT: OK");
+}
+void mostrarPantallaConfiguracion() {
+  char texto[22];
+  oled.setFont(u8g2_font_5x7_tr);
+  oled.drawStr(0, 7, "CONFIG.");
+  snprintf(texto, sizeof(texto), "BAT: %.2fV", voltajeBateria);
+  oled.drawStr(0, 18, texto);
+  snprintf(texto, sizeof(texto), "UMB: %.0f BPM", UMBRAL_BPM);
+  oled.drawStr(0, 28, texto);
+  oled.drawStr(0, 39, "BOOT: VOLVER");
+}
+void actualizarOLED(unsigned long ahora) {
+  if (ahora - ultimaOLED < OLED_INTERVALO_MS) return;
+  ultimaOLED = ahora;
+  oled.clearBuffer();
+  const bool alerta = (estadoAlerta == EstadoAlerta::ACTIVA ||
+                       estadoAlerta == EstadoAlerta::CONFIRMANDO_RECUPERACION);
+  if (alerta || pantallaActual == PantallaOLED::PRINCIPAL)
+    mostrarPantallaPrincipal();
+  else mostrarPantallaConfiguracion();
+  oled.sendBuffer();
 }
 
+// ============================================================
+// 12. MONITOR SERIE
+// ============================================================
+constexpr unsigned long SERIAL_INTERVALO_MS = 2000;
+unsigned long ultimoSerial = 0;
+void actualizarSerial(unsigned long ahora) {
+  if (ahora - ultimoSerial < SERIAL_INTERVALO_MS) return;
+  ultimoSerial = ahora;
+  Serial.print("BPM: "); Serial.print(bpmPromedio, 1);
+  Serial.print(" | Dedo: "); Serial.print(dedoPresente ? "SI" : "NO");
+  Serial.print(" | Bateria: "); Serial.print(voltajeBateria, 3);
+  Serial.print(" V | Estado: ");
+  switch (estadoBateria) {
+    case EstadoBateria::NORMAL: Serial.println("NORMAL"); break;
+    case EstadoBateria::BAJA: Serial.println("BAJA"); break;
+    case EstadoBateria::CRITICA: Serial.println("CRITICA"); break;
+  }
+}
 
 // ============================================================
-// 18. CONFIGURACION INICIAL
+// 13. INICIALIZACION Y BUCLE PRINCIPAL
 // ============================================================
-
 void setup() {
-
-    // --------------------------------------------------------
-    // COMUNICACION SERIE
-    // --------------------------------------------------------
-
-    Serial.begin(115200);
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("PULSOALERT - FIRMWARE 1.3");
-    Serial.println("================================");
-
-    // --------------------------------------------------------
-    // CONFIGURACION DE SALIDAS
-    // --------------------------------------------------------
-
-    // Establecer niveles seguros antes de activar GPIO.
-    digitalWrite(MOTOR_PIN, LOW);
-    digitalWrite(LED_PIN, LED_APAGADO);
-
-    pinMode(MOTOR_PIN, OUTPUT);
-    pinMode(LED_PIN, OUTPUT);
-
-    motorEncendido = false;
-    ledEncendido = false;
-
-    // --------------------------------------------------------
-    // BUS I2C
-    // --------------------------------------------------------
-
-    Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(400000);
-
-    // --------------------------------------------------------
-    // PANTALLA OLED
-    // --------------------------------------------------------
-
-    oled.begin();
-    oled.setContrast(255);
-
+  Serial.begin(115200);
+  pinMode(PIN_MOTOR, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+  apagarMotor();
+  apagarLED();
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATERIA, ADC_11db);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  oled.setI2CAddress(0x3C * 2);
+  oled.begin();
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_5x7_tr);
+  oled.drawStr(0, 12, "PULSOALERT");
+  oled.drawStr(0, 25, "V1.4.1");
+  oled.sendBuffer();
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("ERROR: MAX30102");
     oled.clearBuffer();
-
-    oled.setFont(u8g2_font_6x10_tf);
-    oled.drawStr(0, 12, "INICIANDO");
-
+    oled.drawStr(0, 15, "ERROR SENSOR");
     oled.sendBuffer();
-
-    // --------------------------------------------------------
-    // SENSOR MAX30102
-    // --------------------------------------------------------
-
-    if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
-
-        Serial.println("ERROR MAX30102");
-
-        oled.clearBuffer();
-
-        oled.drawStr(0, 15, "ERROR");
-        oled.drawStr(0, 30, "SENSOR");
-
-        oled.sendBuffer();
-
-        // Detener ejecucion ante fallo de inicializacion.
-        // Las salidas permanecen apagadas.
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    // Configuracion original del sensor.
-    // Se conserva porque fue la mas estable en pruebas.
-    sensor.setup();
-
-    sensor.setPulseAmplitudeRed(0x0A);
-    sensor.setPulseAmplitudeGreen(0);
-
-    // --------------------------------------------------------
-    // INFORMACION DE CONFIGURACION
-    // --------------------------------------------------------
-
-    Serial.println("MAX30102 iniciado");
-
-    Serial.print("Umbral BPM: ");
-    Serial.println(UMBRAL_BPM);
-
-    Serial.print("Tiempo confirmacion (ms): ");
-    Serial.println(TIEMPO_ALERTA);
-
-    Serial.print("Ciclos motor: ");
-    Serial.println(MAX_CICLOS_MOTOR);
-
-    Serial.print("Tiempo LED (ms): ");
-    Serial.println(TIEMPO_MAX_LED);
-
-    Serial.println("Sistema listo");
+    while (true) { apagarMotor(); apagarLED(); delay(1000); }
+  }
+  sensor.setup();
+  actualizarBateria(millis());
+  Serial.println("PulsoAlert v1.4.1 iniciado");
 }
-
-
-// ============================================================
-// 19. BUCLE PRINCIPAL
-// ============================================================
-
 void loop() {
-
-    // --------------------------------------------------------
-    // LECTURA DEL SENSOR
-    // --------------------------------------------------------
-
-    // Mantener el metodo original de lectura.
-    long ir = sensor.getIR();
-
-    dedoDetectado = ir > UMBRAL_DEDO;
-
-    // --------------------------------------------------------
-    // AUSENCIA DE DEDO
-    // --------------------------------------------------------
-
-    if (!dedoDetectado) {
-
-        reiniciarMedicion();
-    }
-
-    // --------------------------------------------------------
-    // DETECCION DE LATIDOS
-    // --------------------------------------------------------
-
-    else if (checkForBeat(ir)) {
-
-        unsigned long ahora = millis();
-
-        if (ultimoLatido != 0) {
-
-            float intervalo =
-                (ahora - ultimoLatido) / 1000.0f;
-
-            if (intervalo > 0) {
-
-                bpm = 60.0f / intervalo;
-
-                // Aceptar solamente valores del rango definido.
-                if (
-                    bpm >= BPM_MIN_VALIDO &&
-                    bpm <= BPM_MAX_VALIDO
-                ) {
-
-                    // Guardar medicion en historial circular.
-                    historialBPM[indice] = (byte)bpm;
-
-                    indice =
-                        (indice + 1) % CANTIDAD_MUESTRAS;
-
-                    if (muestrasValidas < CANTIDAD_MUESTRAS) {
-                        muestrasValidas++;
-                    }
-
-                    // Calcular promedio de las muestras.
-                    int suma = 0;
-
-                    for (
-                        byte i = 0;
-                        i < muestrasValidas;
-                        i++
-                    ) {
-                        suma += historialBPM[i];
-                    }
-
-                    bpmPromedio =
-                        suma / muestrasValidas;
-
-                    // Diagnostico por monitor serie.
-                    Serial.print("BPM: ");
-                    Serial.print(bpm);
-
-                    Serial.print(" | Promedio: ");
-                    Serial.println(bpmPromedio);
-                }
-            }
-        }
-
-        // Registrar el ultimo latido detectado.
-        ultimoLatido = ahora;
-    }
-
-    // --------------------------------------------------------
-    // CONTROL DE ALERTAS
-    // --------------------------------------------------------
-
-    unsigned long ahora = millis();
-
-    evaluarAlerta(ahora);
-
-    // --------------------------------------------------------
-    // ACTUALIZACION DE PANTALLA
-    // --------------------------------------------------------
-
-    if (
-        ahora - ultimaPantalla >= INTERVALO_PANTALLA
-    ) {
-
-        ultimaPantalla = ahora;
-
-        actualizarPantalla(ahora);
-    }
+  const unsigned long ahora = millis();
+  actualizarSensor(ahora);
+  actualizarAlerta(ahora);
+  actualizarMotor(ahora);
+  actualizarLED(ahora);
+  actualizarBateria(ahora);
+  actualizarBotonBoot(ahora);
+  actualizarOLED(ahora);
+  actualizarSerial(ahora);
 }
