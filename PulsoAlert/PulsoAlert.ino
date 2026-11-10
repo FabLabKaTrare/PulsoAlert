@@ -1,5 +1,5 @@
 /*
- * PulsoAlert v1.5.1 - ESP32-C3 OLED 72x40 + MAX30102
+ * PulsoAlert v1.5.3 - ESP32-C3 OLED 72x40 + MAX30102
  *
  * GPIO5 SDA / GPIO6 SCL: OLED y MAX30102 (I2C compartido)
  * GPIO4: driver motor (activo HIGH; NO conectar motor directo)
@@ -10,8 +10,8 @@
  * DESCRIPCION DEL FIRMWARE:
  *   - Detecta latidos y calcula BPM promedio de cuatro muestras.
  *   - Confirma frecuencia baja antes de iniciar la alerta.
- *   - Activa el motor con tres pulsos por ciclo y un maximo de tres ciclos.
- *   - Hace parpadear el LED independientemente del motor hasta 120 s.
+ *   - Activa el motor con tres pulsos por ciclo y 1-5 ciclos configurables.
+ *   - Hace parpadear el LED independientemente del motor durante 1-10 min.
  *   - Confirma recuperacion durante 2 s y cancela la alerta.
  *   - Muestra BPM, estado y bateria en OLED 72x40.
  *   - Permite alternar pantallas con boton BOOT.
@@ -25,6 +25,8 @@
  * v1.5.0: BLE GATT, lecturas y notificaciones (validado con la web).
  * v1.5.1: escritura BLE de configuraciones, persistencia NVS y voltaje
  *         real de LiPo en bytes 6-7 de MEASUREMENT (GATT v1.1).
+ * v1.5.3: version validada en placa y web; identificadores actualizados.
+ *         Sin cambios en la logica de medicion, alertas o BLE.
  *
  * CONTRATO BLE: UUID conservados de GATT v1.0. MEASUREMENT pasa a 8 bytes:
  *  0-1 BPM (uint16 LE; 0=no valido); 2 contacto; 3 bateria % (255=desconocida);
@@ -36,8 +38,8 @@
  *  bytes 2-3: valor vigente del parametro (uint16 LE).
  *
  * NOTA: La bateria % sigue desconocida hasta calibrar una estimacion.
+ * Persistencia de datos confirmada
  * NO ES UN DISPOSITIVO MEDICO. No hay autenticacion BLE en esta version.
- * Escritura de configuracion y persistencia: NO implementadas aun.
  * Prototipo educativo, no dispositivo medico.
  * No interpretar perdida de senal como frecuencia cardiaca baja.
  * La bateria LiPo requiere alimentacion regulada/protegida apropiada.
@@ -211,7 +213,7 @@ void iniciarLED(unsigned long ahora) {
  *
  * Un ciclo consiste en tres pulsos ON de 300 ms, con pausas OFF de
  * 200 ms entre pulsos y una pausa OFF de 1000 ms entre ciclos.
- * El LED se apaga al alcanzar (static_cast<unsigned long>(duracionLEDMinutos) * 60000UL) y no vuelve a encenderse hasta
+ * El LED se apaga al alcanzar la duracion configurada y no vuelve a encenderse hasta
  * que se inicie un nuevo episodio de alerta.
  */
 void actualizarLED(unsigned long ahora) {
@@ -504,7 +506,7 @@ void mostrarPantallaConfiguracion() {
   oled.drawStr(0, 7, "CONFIG.");
   snprintf(texto, sizeof(texto), "BAT: %.2fV", voltajeBateria);
   oled.drawStr(0, 18, texto);
-  snprintf(texto, sizeof(texto), "UMB: %.0f BPM", umbralBPM);
+  snprintf(texto, sizeof(texto), "UMB: %u BPM", static_cast<unsigned>(umbralBPM));
   oled.drawStr(0, 28, texto);
   oled.drawStr(0, 39, "BOOT: VOLVER");
 }
@@ -528,10 +530,15 @@ constexpr unsigned long SERIAL_INTERVALO_MS = 2000;
 unsigned long ultimoSerial = 0;
 // Publica BPM, contacto y estado de bateria cada 2 segundos.
 void actualizarSerial(unsigned long ahora) {
+
+    // Evita enviar datos cuando no hay un monitor USB CDC conectado.
+  // No afecta al sensor, OLED, BLE ni a las alertas.
+  if (!Serial) return;
+
   if (ahora - ultimoSerial < SERIAL_INTERVALO_MS) return;
   ultimoSerial = ahora;
   Serial.print("BPM: "); Serial.print(bpmPromedio, 1);
-  Serial.print(" | Dedo: "); Serial.print(dedoPresente ? "SI" : "NO");
+  Serial.print(" | Contacto: "); Serial.print(dedoPresente ? "SI" : "NO");
   Serial.print(" | Bateria: "); Serial.print(voltajeBateria, 3);
   Serial.print(" V | Estado: ");
   switch (estadoBateria) {
@@ -591,6 +598,19 @@ struct SolicitudBLE {
   uint8_t longitud;
   uint8_t datos[2];
 };
+
+/**
+ * @brief Prototipos explicitos de funciones que reciben tipos propios BLE.
+ * @details El preprocesador de Arduino genera prototipos automaticamente y,
+ *          dependiendo de la version del IDE, puede colocarlos antes de
+ *          las declaraciones de enum y struct. Estas declaraciones manuales
+ *          garantizan que los tipos ya se conocen al declarar las funciones.
+ *          No modifican la logica ni los datos del contrato GATT.
+ */
+void publicarParametroBLE(ParametroBLE parametro);
+uint16_t valorVigenteBLE(ParametroBLE parametro);
+void publicarEstadoConfiguracion(ResultadoBLE resultado, ParametroBLE parametro);
+void procesarSolicitudBLE(const SolicitudBLE& solicitud);
 
 // Cola FreeRTOS: protege el intercambio entre la tarea BLE y el loop de Arduino.
 QueueHandle_t colaEscriturasBLE = nullptr;
@@ -923,7 +943,7 @@ void setup() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_5x7_tr);
   oled.drawStr(0, 12, "PULSOALERT");
-  oled.drawStr(0, 25, "V1.5.1");
+  oled.drawStr(0, 25, "V1.5.3");
   oled.sendBuffer();
   if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
     Serial.println("ERROR: MAX30102");
@@ -936,7 +956,7 @@ void setup() {
   actualizarBateria(millis());
   cargarConfiguracion(); // Restaurar umbral, ciclos y LED ANTES de anunciar BLE.
   iniciarBLE();
-  Serial.println("PulsoAlert v1.5.1 iniciado (BLE escritura + NVS + bateria mV)");
+  Serial.println("PulsoAlert v1.5.3 iniciado (BLE escritura + NVS + bateria mV)");
 }
 /*
  * Bucle principal cooperativo: sensor, alertas, motor, LED, bateria,
@@ -951,7 +971,7 @@ void loop() {
   actualizarBateria(ahora);
   actualizarBotonBoot(ahora);
   actualizarOLED(ahora);
-  actualizarSerial(ahora);
+//  actualizarSerial(ahora);
   actualizarConfiguracionBLE(); // Ejecutar NVS fuera de los callbacks BLE.
   actualizarBLE(ahora);
 }
