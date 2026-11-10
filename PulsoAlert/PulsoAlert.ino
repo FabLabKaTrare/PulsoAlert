@@ -1,5 +1,5 @@
 /*
- * PulsoAlert v1.5.0 - ESP32-C3 OLED 72x40 + MAX30102
+ * PulsoAlert v1.5.1 - ESP32-C3 OLED 72x40 + MAX30102
  *
  * GPIO5 SDA / GPIO6 SCL: OLED y MAX30102 (I2C compartido)
  * GPIO4: driver motor (activo HIGH; NO conectar motor directo)
@@ -22,7 +22,21 @@
  *   - Conserva la logica de motor, sensor, bateria, boton y OLED.
  *   - Agrega documentacion de variables, estados y funciones.
  *
- * NUEVO v1.5.0: servicio BLE GATT v1.0, lecturas y notificaciones.
+ * v1.5.0: BLE GATT, lecturas y notificaciones (validado con la web).
+ * v1.5.1: escritura BLE de configuraciones, persistencia NVS y voltaje
+ *         real de LiPo en bytes 6-7 de MEASUREMENT (GATT v1.1).
+ *
+ * CONTRATO BLE: UUID conservados de GATT v1.0. MEASUREMENT pasa a 8 bytes:
+ *  0-1 BPM (uint16 LE; 0=no valido); 2 contacto; 3 bateria % (255=desconocida);
+ *  4 alerta; 5 estado; 6-7 voltaje bateria en mV (uint16 LE; 0=no disponible).
+ *  Web v0.5.0 debe actualizarse para leer los dos bytes adicionales.
+ *
+ * CONFIG_STATUS (4 bytes): codigo 0=inicial, 1=guardado, 2=invalido,
+ *  3=error NVS; parametro 0=ninguno, 1=umbral, 2=ciclos, 3=LED;
+ *  bytes 2-3: valor vigente del parametro (uint16 LE).
+ *
+ * NOTA: La bateria % sigue desconocida hasta calibrar una estimacion.
+ * NO ES UN DISPOSITIVO MEDICO. No hay autenticacion BLE en esta version.
  * Escritura de configuracion y persistencia: NO implementadas aun.
  * Prototipo educativo, no dispositivo medico.
  * No interpretar perdida de senal como frecuencia cardiaca baja.
@@ -37,6 +51,9 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Preferences.h>   // Memoria NVS no volatil del ESP32-C3.
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>  // Desacopla callbacks BLE del bucle de medicion.
 
 // ============================================================
 // 1. HARDWARE Y CONFIGURACION
@@ -78,21 +95,25 @@ bool bpmValido = false;
 // ============================================================
 // 3. ALERTAS: UMBRAL, RECUPERACION Y ACTUADORES
 // ============================================================
-// Valores de configuracion actuales; se podran exponer por BLE en otra etapa.
+// Parametros configurables por BLE; iniciales o restaurados desde NVS.
 // Frecuencia promedio por debajo de la cual se confirma una alerta.
-constexpr float UMBRAL_BPM = 50.0f;
+// Valores efectivos: se recuperan de NVS al iniciar y pueden cambiar por BLE.
+// Se usan enteros porque el contrato GATT define valores enteros.
+uint16_t umbralBPM = 50;
 constexpr unsigned long CONFIRMAR_BAJA_MS = 5000;
 // Tiempo de BPM recuperado antes de cancelar la alerta activa.
 constexpr unsigned long CONFIRMAR_RECUPERACION_MS = 2000;
 // Duracion maxima de la indicacion luminosa desde el inicio de la alerta.
-constexpr unsigned long LED_MAX_MS = 120000;
+// Duracion configurable expresada en minutos; el temporizador usa ms.
+uint16_t duracionLEDMinutos = 2;
 // Patron temporal compartido: 300 ms ON, 200 ms OFF, 3 pulsos,
 // seguidos por una pausa de 1000 ms entre ciclos.
 constexpr unsigned long MOTOR_PULSO_MS = 300;
 constexpr unsigned long MOTOR_ENTREPULSOS_MS = 200;
 constexpr unsigned long MOTOR_ENTRECICLOS_MS = 1000;
 constexpr uint8_t PULSOS_POR_CICLO = 3;
-constexpr uint8_t MAX_CICLOS = 3;
+// Numero maximo de ciclos por episodio, configurable de 1 a 5.
+uint8_t maxCiclos = 3;
 
 // Estados del episodio: normal, confirmando baja, activo y
 // confirmando recuperacion. La alerta no se rearma mientras siga activa.
@@ -180,7 +201,7 @@ void iniciarMotor(unsigned long ahora) {
  */
 void iniciarLED(unsigned long ahora) {
   inicioLED = ahora;
-  ledActivo = (LED_MAX_MS > 0);
+  ledActivo = ((static_cast<unsigned long>(duracionLEDMinutos) * 60000UL) > 0);
   digitalWrite(PIN_LED, ledActivo ? LED_ON : LED_OFF);
 }
 
@@ -190,14 +211,14 @@ void iniciarLED(unsigned long ahora) {
  *
  * Un ciclo consiste en tres pulsos ON de 300 ms, con pausas OFF de
  * 200 ms entre pulsos y una pausa OFF de 1000 ms entre ciclos.
- * El LED se apaga al alcanzar LED_MAX_MS y no vuelve a encenderse hasta
+ * El LED se apaga al alcanzar (static_cast<unsigned long>(duracionLEDMinutos) * 60000UL) y no vuelve a encenderse hasta
  * que se inicie un nuevo episodio de alerta.
  */
 void actualizarLED(unsigned long ahora) {
   if (!ledActivo) return;
 
   const unsigned long transcurrido = ahora - inicioLED;
-  if (transcurrido >= LED_MAX_MS) {
+  if (transcurrido >= (static_cast<unsigned long>(duracionLEDMinutos) * 60000UL)) {
     apagarLED();
     return;
   }
@@ -246,7 +267,7 @@ void actualizarMotor(unsigned long ahora) {
           estadoMotor = EstadoMotor::PULSO;
         } else {
           ++ciclosTerminados;
-          estadoMotor = (ciclosTerminados >= MAX_CICLOS)
+          estadoMotor = (ciclosTerminados >= maxCiclos)
             ? EstadoMotor::TERMINADO : EstadoMotor::PAUSA_CICLO;
         }
       }
@@ -340,7 +361,7 @@ void activarAlerta(unsigned long ahora) {
  */
 void actualizarAlerta(unsigned long ahora) {
   if (!dedoPresente || !bpmValido) { cancelarAlerta(); return; }
-  const bool bpmBajas = bpmPromedio < UMBRAL_BPM;
+  const bool bpmBajas = bpmPromedio < umbralBPM;
   switch (estadoAlerta) {
     case EstadoAlerta::NORMAL:
       if (bpmBajas) { inicioBaja = ahora; estadoAlerta = EstadoAlerta::CONFIRMANDO_BAJA; }
@@ -483,7 +504,7 @@ void mostrarPantallaConfiguracion() {
   oled.drawStr(0, 7, "CONFIG.");
   snprintf(texto, sizeof(texto), "BAT: %.2fV", voltajeBateria);
   oled.drawStr(0, 18, texto);
-  snprintf(texto, sizeof(texto), "UMB: %.0f BPM", UMBRAL_BPM);
+  snprintf(texto, sizeof(texto), "UMB: %.0f BPM", umbralBPM);
   oled.drawStr(0, 28, texto);
   oled.drawStr(0, 39, "BOOT: VOLVER");
 }
@@ -521,11 +542,9 @@ void actualizarSerial(unsigned long ahora) {
 }
 
 // ============================================================
-// 14. BLUETOOTH LOW ENERGY: GATT v1.0 (ETAPA DE CONEXION)
+// 12. BLE GATT + CONFIGURACION PERSISTENTE (NVS)
 // ============================================================
-// Los UUID son los definidos en el contrato compartido con PulsoAlert Web.
-// Las caracteristicas de configuracion son SOLO LECTURA en esta etapa.
-// No se anuncian permisos de escritura que el firmware aun no implementa.
+// UUID acordados con PulsoAlert Web: NO cambiarlos unilateralmente.
 constexpr char BLE_NOMBRE[] = "PulsoAlert";
 constexpr char UUID_SERVICIO[] = "f0a10000-7b4d-4c6a-9e20-3b8c8f100001";
 constexpr char UUID_MEDICION[] = "f0a10001-7b4d-4c6a-9e20-3b8c8f100001";
@@ -534,11 +553,17 @@ constexpr char UUID_CICLOS[] = "f0a10003-7b4d-4c6a-9e20-3b8c8f100001";
 constexpr char UUID_LED[] = "f0a10004-7b4d-4c6a-9e20-3b8c8f100001";
 constexpr char UUID_ESTADO_CONFIG[] = "f0a10005-7b4d-4c6a-9e20-3b8c8f100001";
 
-// Tiempo entre publicaciones BLE: no introduce pausas en el loop principal.
+// Namespace y claves NVS. Mantenerlos para preservar ajustes entre versiones.
+constexpr char NVS_ESPACIO[] = "pulsoalert";
+constexpr char NVS_UMBRAL[] = "umbral";
+constexpr char NVS_CICLOS[] = "ciclos";
+constexpr char NVS_LED[] = "ledmin";
+
+// Publicacion de mediciones cada segundo sin detener la adquisicion del sensor.
 constexpr unsigned long BLE_PUBLICACION_MS = 1000;
 unsigned long ultimaPublicacionBLE = 0;
 
-// Punteros administrados por la biblioteca BLE, creados en iniciarBLE().
+// Objetos creados una sola vez; son propiedad de la biblioteca BLE.
 BLEServer* servidorBLE = nullptr;
 BLECharacteristic* caracteristicaMedicion = nullptr;
 BLECharacteristic* caracteristicaUmbral = nullptr;
@@ -546,24 +571,177 @@ BLECharacteristic* caracteristicaCiclos = nullptr;
 BLECharacteristic* caracteristicaLED = nullptr;
 BLECharacteristic* caracteristicaEstadoConfig = nullptr;
 
-// Solo se modifica desde los callbacks BLE; volatile indica acceso asincrono.
+// Variables modificadas desde callbacks BLE; solo son banderas de comunicacion.
 volatile bool clienteBLEConectado = false;
 volatile bool reiniciarPublicidadBLE = false;
 
+// Identificadores definidos en el contrato GATT v1.0.
+enum class ParametroBLE : uint8_t { NINGUNO = 0, UMBRAL = 1, CICLOS = 2, LED = 3 };
+enum class ResultadoBLE : uint8_t { INICIAL = 0, GUARDADO = 1, INVALIDO = 2, ERROR_NVS = 3 };
+
 /**
- * @brief Atiende los eventos de conexion y desconexion del servidor BLE.
- * Los callbacks no realizan operaciones de sensor ni actualizaciones OLED.
+ * @brief Solicitud de escritura capturada por el callback BLE.
+ * @details Los callbacks NO escriben NVS: dejan el trabajo al loop principal.
+ * @param parametro Identificador del ajuste solicitado (1, 2 o 3).
+ * @param longitud Numero de bytes recibidos (se conserva para validar).
+ * @param datos Hasta dos bytes, en orden little-endian.
+ */
+struct SolicitudBLE {
+  uint8_t parametro;
+  uint8_t longitud;
+  uint8_t datos[2];
+};
+
+// Cola FreeRTOS: protege el intercambio entre la tarea BLE y el loop de Arduino.
+QueueHandle_t colaEscriturasBLE = nullptr;
+
+/**
+ * @brief Convierte un entero sin signo a dos bytes little-endian.
+ * @param destino Arreglo con espacio para al menos dos bytes.
+ * @param valor Entero a serializar.
+ */
+void escribirUint16LE(uint8_t* destino, uint16_t valor) {
+  destino[0] = static_cast<uint8_t>(valor & 0xFF);
+  destino[1] = static_cast<uint8_t>((valor >> 8) & 0xFF);
+}
+
+/**
+ * @brief Interpreta dos bytes little-endian como un entero sin signo.
+ * @param origen Arreglo de al menos dos bytes, previamente validado.
+ * @return Valor uint16 recibido.
+ */
+uint16_t leerUint16LE(const uint8_t* origen) {
+  return static_cast<uint16_t>(origen[0]) |
+         (static_cast<uint16_t>(origen[1]) << 8);
+}
+
+/**
+ * @brief Recupera ajustes persistidos, validando sus rangos.
+ * @details Si NVS no existe, falla o contiene valores fuera de rango,
+ *          se mantienen los valores iniciales seguros del prototipo.
+ */
+void cargarConfiguracion() {
+  Preferences preferencias;
+  if (!preferencias.begin(NVS_ESPACIO, true)) {
+    Serial.println("NVS: lectura no disponible; usando valores iniciales");
+    return;
+  }
+  const uint16_t umbral = preferencias.getUShort(NVS_UMBRAL, 50);
+  const uint8_t ciclos = preferencias.getUChar(NVS_CICLOS, 3);
+  const uint16_t led = preferencias.getUShort(NVS_LED, 2);
+  preferencias.end();
+  umbralBPM = (umbral >= 30 && umbral <= 120) ? umbral : 50;
+  maxCiclos = (ciclos >= 1 && ciclos <= 5) ? ciclos : 3;
+  duracionLEDMinutos = (led >= 1 && led <= 10) ? led : 2;
+  Serial.printf("NVS: umbral=%u BPM | ciclos=%u | LED=%u min\n",
+                umbralBPM, maxCiclos, duracionLEDMinutos);
+}
+
+/**
+ * @brief Escribe el valor vigente de un parametro en su caracteristica GATT.
+ * @param parametro Ajuste que debe actualizarse.
+ * @details Permite a la web verificar el valor mediante lectura posterior.
+ */
+void publicarParametroBLE(ParametroBLE parametro) {
+  uint8_t bytes[2] = {};
+  switch (parametro) {
+    case ParametroBLE::UMBRAL:
+      if (caracteristicaUmbral) {
+        escribirUint16LE(bytes, umbralBPM);
+        caracteristicaUmbral->setValue(bytes, 2);
+      }
+      break;
+    case ParametroBLE::CICLOS:
+      if (caracteristicaCiclos) {
+        bytes[0] = maxCiclos;
+        caracteristicaCiclos->setValue(bytes, 1);
+      }
+      break;
+    case ParametroBLE::LED:
+      if (caracteristicaLED) {
+        escribirUint16LE(bytes, duracionLEDMinutos);
+        caracteristicaLED->setValue(bytes, 2);
+      }
+      break;
+    default: break;
+  }
+}
+
+/**
+ * @brief Obtiene el valor vigente para CONFIG_STATUS.
+ * @param parametro Identificador del ajuste.
+ * @return Valor actual, o cero si no corresponde a un parametro conocido.
+ */
+uint16_t valorVigenteBLE(ParametroBLE parametro) {
+  switch (parametro) {
+    case ParametroBLE::UMBRAL: return umbralBPM;
+    case ParametroBLE::CICLOS: return maxCiclos;
+    case ParametroBLE::LED: return duracionLEDMinutos;
+    default: return 0;
+  }
+}
+
+/**
+ * @brief Informa el resultado de una escritura con CONFIG_STATUS.
+ * @param resultado Codigo 0..3 definido en el contrato.
+ * @param parametro Identificador 0..3 del ajuste procesado.
+ * @details Los bytes 2 y 3 reflejan el valor REAL vigente, no el solicitado.
+ */
+void publicarEstadoConfiguracion(ResultadoBLE resultado, ParametroBLE parametro) {
+  if (!caracteristicaEstadoConfig) return;
+  uint8_t datos[4] = {
+    static_cast<uint8_t>(resultado), static_cast<uint8_t>(parametro), 0, 0
+  };
+  escribirUint16LE(&datos[2], valorVigenteBLE(parametro));
+  caracteristicaEstadoConfig->setValue(datos, sizeof(datos));
+  if (clienteBLEConectado) caracteristicaEstadoConfig->notify();
+}
+
+/**
+ * @brief Recibe una escritura GATT y la entrega a la cola de procesamiento.
+ * @details No modifica configuracion ni escribe memoria desde el callback.
+ */
+class EventosEscrituraBLE : public BLECharacteristicCallbacks {
+ public:
+  /**
+   * @brief Captura el valor binario enviado por el navegador.
+   * @param caracteristica Caracteristica cuyo valor acaba de escribirse.
+   */
+  void onWrite(BLECharacteristic* caracteristica) override {
+    ParametroBLE parametro = ParametroBLE::NINGUNO;
+    if (caracteristica == caracteristicaUmbral) parametro = ParametroBLE::UMBRAL;
+    else if (caracteristica == caracteristicaCiclos) parametro = ParametroBLE::CICLOS;
+    else if (caracteristica == caracteristicaLED) parametro = ParametroBLE::LED;
+    if (parametro == ParametroBLE::NINGUNO || colaEscriturasBLE == nullptr) return;
+
+    // 'auto' permite compilar con versiones de la biblioteca que devuelven
+    // String (core ESP32 nuevo) o std::string (versiones anteriores).
+    const auto recibido = caracteristica->getValue();
+    SolicitudBLE solicitud = {};
+    solicitud.parametro = static_cast<uint8_t>(parametro);
+    solicitud.longitud = static_cast<uint8_t>(recibido.length() > 255 ? 255 : recibido.length());
+    if (recibido.length() > 0) solicitud.datos[0] = static_cast<uint8_t>(recibido[0]);
+    if (recibido.length() > 1) solicitud.datos[1] = static_cast<uint8_t>(recibido[1]);
+    if (xQueueSend(colaEscriturasBLE, &solicitud, 0) != pdTRUE) {
+      // Una sola escritura a la vez es requisito del contrato de la web.
+      // Si la cola se llena, no afirmamos que la operacion fue guardada.
+      Serial.println("BLE: cola de configuracion llena; escritura no procesada");
+    }
+  }
+};
+
+/**
+ * @brief Marca los eventos de conexion del cliente y reanuncio BLE.
  */
 class EventosServidorBLE : public BLEServerCallbacks {
  public:
-  /** @brief Marca la conexion de un cliente BLE. */
+  /** @brief Notifica que un navegador se conecto. */
   void onConnect(BLEServer* servidor) override {
-    (void)servidor; // Parametro requerido por la biblioteca, no utilizado.
+    (void)servidor;
     clienteBLEConectado = true;
     Serial.println("BLE: cliente conectado");
   }
-
-  /** @brief Solicita reanunciar el dispositivo despues de desconectar. */
+  /** @brief Solicita reiniciar publicidad tras la desconexion. */
   void onDisconnect(BLEServer* servidor) override {
     (void)servidor;
     clienteBLEConectado = false;
@@ -573,90 +751,146 @@ class EventosServidorBLE : public BLEServerCallbacks {
 };
 
 /**
- * @brief Codifica un entero de 16 bits en orden little-endian.
- * @param destino Puntero a dos bytes de salida.
- * @param valor Numero que se desea codificar.
+ * @brief Valida, persiste y aplica una escritura BLE en el loop principal.
+ * @param solicitud Solicitud con identificador, longitud y bytes recibidos.
+ * @details No cambia el valor efectivo hasta comprobar que NVS lo guardo.
+ *          En caso de error, se restaura la caracteristica al valor vigente.
  */
-void escribirUint16LE(uint8_t* destino, uint16_t valor) {
-  destino[0] = static_cast<uint8_t>(valor & 0xFF);
-  destino[1] = static_cast<uint8_t>((valor >> 8) & 0xFF);
+void procesarSolicitudBLE(const SolicitudBLE& solicitud) {
+  const ParametroBLE parametro = static_cast<ParametroBLE>(solicitud.parametro);
+  const uint8_t longitudEsperada = (parametro == ParametroBLE::CICLOS) ? 1 : 2;
+  const uint16_t valor = longitudEsperada == 1
+      ? solicitud.datos[0] : leerUint16LE(solicitud.datos);
+  bool valido = solicitud.longitud == longitudEsperada;
+  switch (parametro) {
+    case ParametroBLE::UMBRAL: valido = valido && valor >= 30 && valor <= 120; break;
+    case ParametroBLE::CICLOS: valido = valido && valor >= 1 && valor <= 5; break;
+    case ParametroBLE::LED: valido = valido && valor >= 1 && valor <= 10; break;
+    default: valido = false; break;
+  }
+  if (!valido) {
+    publicarParametroBLE(parametro);
+    publicarEstadoConfiguracion(ResultadoBLE::INVALIDO, parametro);
+    Serial.printf("BLE: parametro %u invalido (longitud=%u, valor=%u)\n",
+                  solicitud.parametro, solicitud.longitud, valor);
+    return;
+  }
+
+  Preferences preferencias;
+  bool guardado = preferencias.begin(NVS_ESPACIO, false);
+  if (guardado) {
+    size_t escritos = 0;
+    switch (parametro) {
+      case ParametroBLE::UMBRAL: escritos = preferencias.putUShort(NVS_UMBRAL, valor); guardado = escritos == 2; break;
+      case ParametroBLE::CICLOS: escritos = preferencias.putUChar(NVS_CICLOS, static_cast<uint8_t>(valor)); guardado = escritos == 1; break;
+      case ParametroBLE::LED: escritos = preferencias.putUShort(NVS_LED, valor); guardado = escritos == 2; break;
+      default: guardado = false; break;
+    }
+    preferencias.end();
+  }
+  if (!guardado) {
+    publicarParametroBLE(parametro);
+    publicarEstadoConfiguracion(ResultadoBLE::ERROR_NVS, parametro);
+    Serial.printf("BLE: error al guardar parametro %u en NVS\n", solicitud.parametro);
+    return;
+  }
+
+  // Aplicar solamente despues de guardar: valores seguros tras reiniciar.
+  switch (parametro) {
+    case ParametroBLE::UMBRAL: umbralBPM = valor; break;
+    case ParametroBLE::CICLOS: maxCiclos = static_cast<uint8_t>(valor); break;
+    case ParametroBLE::LED: duracionLEDMinutos = valor; break;
+    default: break;
+  }
+  publicarParametroBLE(parametro);
+  publicarEstadoConfiguracion(ResultadoBLE::GUARDADO, parametro);
+  Serial.printf("BLE: parametro %u guardado=%u\n", solicitud.parametro, valor);
 }
 
 /**
- * @brief Actualiza el paquete de medicion de seis bytes del contrato GATT.
- * No inventa porcentaje de bateria: 255 indica desconocido mientras no
- * exista una estimacion porcentual validada para la bateria real.
+ * @brief Procesa solicitudes BLE pendientes sin bloquear esperando mensajes.
+ * @details Se atiende como maximo una solicitud por iteracion del loop.
+ */
+void actualizarConfiguracionBLE() {
+  if (colaEscriturasBLE == nullptr) return;
+  SolicitudBLE solicitud = {};
+  if (xQueueReceive(colaEscriturasBLE, &solicitud, 0) == pdTRUE)
+    procesarSolicitudBLE(solicitud);
+}
+
+/**
+ * @brief Construye MEASUREMENT v1.1 de 8 bytes y notifica al navegador.
+ * @details Los primeros seis bytes son compatibles con GATT v1.0.
+ *          Bateria en porcentaje = 255 (no calibrada); voltaje en mV.
  */
 void publicarMedicionBLE() {
-  if (caracteristicaMedicion == nullptr) return;
-
-  // BPM 0 significa lectura no valida; el promedio se redondea al entero.
+  if (!caracteristicaMedicion) return;
   const uint16_t bpm = (dedoPresente && bpmValido)
-    ? static_cast<uint16_t>(bpmPromedio + 0.5f) : 0;
-
-  // La alerta se considera activa tambien durante la confirmacion de recuperacion.
+      ? static_cast<uint16_t>(bpmPromedio + 0.5f) : 0;
   const bool alerta = (estadoAlerta == EstadoAlerta::ACTIVA ||
                        estadoAlerta == EstadoAlerta::CONFIRMANDO_RECUPERACION);
-
-  // Estado 0: esperando contacto; 1: midiendo; 2: contacto sin BPM valido.
   const uint8_t estado = !dedoPresente ? 0 : (bpmValido ? 1 : 2);
-  uint8_t paquete[6] = {};
-  escribirUint16LE(paquete, bpm);  // Bytes 0-1: BPM uint16 LE.
-  paquete[2] = dedoPresente ? 1 : 0; // Byte 2: contacto.
-  paquete[3] = 255;                // Byte 3: bateria desconocida.
-  paquete[4] = alerta ? 1 : 0;     // Byte 4: alerta activa.
-  paquete[5] = estado;             // Byte 5: estado de medicion.
-
+  // La lectura ADC y divisor ya estan validados en el hardware del proyecto.
+  // Se limita al rango uint16 y se envia 0 si la lectura no esta disponible.
+  const uint16_t milivoltios = bateriaInicializada && voltajeBateria > 0.0f
+      ? static_cast<uint16_t>(constrain(voltajeBateria * 1000.0f, 0.0f, 65535.0f) + 0.5f)
+      : 0;
+  uint8_t paquete[8] = {};
+  escribirUint16LE(&paquete[0], bpm); // 0-1: BPM uint16 LE.
+  paquete[2] = dedoPresente ? 1 : 0; // 2: contacto.
+  paquete[3] = 255;                 // 3: bateria % desconocida.
+  paquete[4] = alerta ? 1 : 0;      // 4: alerta activa.
+  paquete[5] = estado;              // 5: estado de medicion.
+  escribirUint16LE(&paquete[6], milivoltios); // 6-7: voltaje LiPo mV.
   caracteristicaMedicion->setValue(paquete, sizeof(paquete));
   if (clienteBLEConectado) caracteristicaMedicion->notify();
 }
 
 /**
- * @brief Crea el servidor, las cinco caracteristicas y la publicidad BLE.
- * Las tres configuraciones se exponen con valores reales fijos de v1.4.2.
- * CONFIG_STATUS permanece en cero porque no hay operaciones de escritura.
+ * @brief Inicializa BLE, cinco caracteristicas, callbacks y publicidad.
+ * @details Los UUID siguen siendo los de GATT v1.0; la medicion usa 8 bytes.
  */
 void iniciarBLE() {
+  colaEscriturasBLE = xQueueCreate(8, sizeof(SolicitudBLE));
+  if (colaEscriturasBLE == nullptr) {
+    Serial.println("ERROR BLE: no se pudo crear la cola de escrituras");
+    return;
+  }
   BLEDevice::init(BLE_NOMBRE);
   servidorBLE = BLEDevice::createServer();
   servidorBLE->setCallbacks(new EventosServidorBLE());
   BLEService* servicio = servidorBLE->createService(UUID_SERVICIO);
-
   caracteristicaMedicion = servicio->createCharacteristic(
-    UUID_MEDICION, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+      UUID_MEDICION, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   caracteristicaMedicion->addDescriptor(new BLE2902());
-
-  caracteristicaUmbral = servicio->createCharacteristic(UUID_UMBRAL, BLECharacteristic::PROPERTY_READ);
-  caracteristicaCiclos = servicio->createCharacteristic(UUID_CICLOS, BLECharacteristic::PROPERTY_READ);
-  caracteristicaLED = servicio->createCharacteristic(UUID_LED, BLECharacteristic::PROPERTY_READ);
+  caracteristicaUmbral = servicio->createCharacteristic(
+      UUID_UMBRAL, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  caracteristicaCiclos = servicio->createCharacteristic(
+      UUID_CICLOS, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  caracteristicaLED = servicio->createCharacteristic(
+      UUID_LED, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  caracteristicaUmbral->setCallbacks(new EventosEscrituraBLE());
+  caracteristicaCiclos->setCallbacks(new EventosEscrituraBLE());
+  caracteristicaLED->setCallbacks(new EventosEscrituraBLE());
   caracteristicaEstadoConfig = servicio->createCharacteristic(
-    UUID_ESTADO_CONFIG, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+      UUID_ESTADO_CONFIG, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   caracteristicaEstadoConfig->addDescriptor(new BLE2902());
-
-  // En esta etapa los valores son constantes; no se modifica la logica de alerta.
-  uint8_t umbral[2];
-  escribirUint16LE(umbral, static_cast<uint16_t>(UMBRAL_BPM));
-  caracteristicaUmbral->setValue(umbral, sizeof(umbral));
-  uint8_t ciclos[1] = { MAX_CICLOS };
-  caracteristicaCiclos->setValue(ciclos, sizeof(ciclos));
-  uint8_t duracion[2];
-  escribirUint16LE(duracion, static_cast<uint16_t>(LED_MAX_MS / 60000UL));
-  caracteristicaLED->setValue(duracion, sizeof(duracion));
-  uint8_t estadoConfig[4] = {0, 0, 0, 0};
-  caracteristicaEstadoConfig->setValue(estadoConfig, sizeof(estadoConfig));
-
-  publicarMedicionBLE(); // Valor inicial disponible incluso antes de conectar.
+  publicarParametroBLE(ParametroBLE::UMBRAL);
+  publicarParametroBLE(ParametroBLE::CICLOS);
+  publicarParametroBLE(ParametroBLE::LED);
+  publicarEstadoConfiguracion(ResultadoBLE::INICIAL, ParametroBLE::NINGUNO);
+  publicarMedicionBLE();
   servicio->start();
   BLEAdvertising* publicidad = BLEDevice::getAdvertising();
   publicidad->addServiceUUID(UUID_SERVICIO);
   publicidad->setScanResponse(true);
   publicidad->start();
-  Serial.println("BLE: PulsoAlert anunciando servicio GATT v1.0");
+  Serial.println("BLE: PulsoAlert GATT v1.1 anunciado (8 bytes + escritura NVS)");
 }
 
 /**
- * @brief Mantiene las notificaciones y recupera la publicidad tras desconectar.
- * @param ahora Tiempo actual de millis() en milisegundos.
+ * @brief Mantiene las notificaciones y reinicia publicidad tras desconectar.
+ * @param ahora Tiempo actual en milisegundos (millis).
  */
 void actualizarBLE(unsigned long ahora) {
   if (reiniciarPublicidadBLE) {
@@ -689,7 +923,7 @@ void setup() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_5x7_tr);
   oled.drawStr(0, 12, "PULSOALERT");
-  oled.drawStr(0, 25, "V1.5.0");
+  oled.drawStr(0, 25, "V1.5.1");
   oled.sendBuffer();
   if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
     Serial.println("ERROR: MAX30102");
@@ -700,8 +934,9 @@ void setup() {
   }
   sensor.setup();
   actualizarBateria(millis());
+  cargarConfiguracion(); // Restaurar umbral, ciclos y LED ANTES de anunciar BLE.
   iniciarBLE();
-  Serial.println("PulsoAlert v1.5.0 iniciado (BLE solo lectura)");
+  Serial.println("PulsoAlert v1.5.1 iniciado (BLE escritura + NVS + bateria mV)");
 }
 /*
  * Bucle principal cooperativo: sensor, alertas, motor, LED, bateria,
@@ -717,5 +952,6 @@ void loop() {
   actualizarBotonBoot(ahora);
   actualizarOLED(ahora);
   actualizarSerial(ahora);
+  actualizarConfiguracionBLE(); // Ejecutar NVS fuera de los callbacks BLE.
   actualizarBLE(ahora);
 }
